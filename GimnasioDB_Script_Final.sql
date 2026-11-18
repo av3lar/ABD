@@ -28,15 +28,25 @@ BEGIN
 END
 GO
 
+-- Borra los jobs antes que los logins, porque su dueño es login_respaldo
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'GimnasioDB - Backup FULL')
+    EXEC msdb.dbo.sp_delete_job @job_name = N'GimnasioDB - Backup FULL', @delete_unused_schedule = 1;
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'GimnasioDB - Backup DIFERENCIAL')
+    EXEC msdb.dbo.sp_delete_job @job_name = N'GimnasioDB - Backup DIFERENCIAL', @delete_unused_schedule = 1;
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'GimnasioDB - Backup LOG')
+    EXEC msdb.dbo.sp_delete_job @job_name = N'GimnasioDB - Backup LOG', @delete_unused_schedule = 1;
+
 IF EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'login_recepcion')
     DROP LOGIN login_recepcion;
 IF EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'login_facturacion')
     DROP LOGIN login_facturacion;
 IF EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'login_powerbi')
     DROP LOGIN login_powerbi;
+IF EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'login_respaldo')
+    DROP LOGIN login_respaldo;
 GO
 
--- 2. Logins de recepción, facturación y Power BI
+-- 2. Logins de recepción, facturación, Power BI y respaldos
 CREATE LOGIN login_recepcion
     WITH PASSWORD = 'PasswordRec#2026',
     CHECK_POLICY = ON,
@@ -49,6 +59,12 @@ CREATE LOGIN login_facturacion
 
 CREATE LOGIN login_powerbi
     WITH PASSWORD = 'PasswordBI#2026',
+    CHECK_POLICY = ON,
+    CHECK_EXPIRATION = OFF;
+
+-- Login solo para los backups
+CREATE LOGIN login_respaldo
+    WITH PASSWORD = 'PasswordResp#2026',
     CHECK_POLICY = ON,
     CHECK_EXPIRATION = OFF;
 GO
@@ -291,6 +307,7 @@ GO
 CREATE USER usr_recepcion FOR LOGIN login_recepcion;
 CREATE USER usr_facturacion FOR LOGIN login_facturacion;
 CREATE USER usr_powerbi FOR LOGIN login_powerbi;
+CREATE USER usr_respaldo FOR LOGIN login_respaldo;
 GO
 
 CREATE ROLE rol_recepcion;
@@ -319,6 +336,9 @@ GO
 ALTER ROLE rol_recepcion ADD MEMBER usr_recepcion;
 ALTER ROLE rol_cajero ADD MEMBER usr_facturacion;
 ALTER ROLE rol_reporteria ADD MEMBER usr_powerbi;
+
+-- usr_respaldo solo puede hacer backups (rol fijo db_backupoperator)
+ALTER ROLE db_backupoperator ADD MEMBER usr_respaldo;
 GO
 
 -- 9. Auditoría con SQL Server Audit (archivos .sqlaudit en la carpeta SQLAudit de la instancia)
@@ -1038,10 +1058,12 @@ IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'GimnasioDB - Backup LOG
     EXEC msdb.dbo.sp_delete_job @job_name = N'GimnasioDB - Backup LOG', @delete_unused_schedule = 1;
 GO
 
+-- Los jobs tienen como dueño a login_respaldo, así se ejecutan con sus permisos y no con sa
 -- FULL: lunes a las 3:00 PM (21:00 UTC)
 EXEC msdb.dbo.sp_add_job
-     @job_name    = N'GimnasioDB - Backup FULL',
-     @description = N'Backup completo semanal, lunes 3:00 PM (21:00 UTC)';
+     @job_name         = N'GimnasioDB - Backup FULL',
+     @description      = N'Backup completo semanal, lunes 3:00 PM (21:00 UTC)',
+     @owner_login_name = N'login_respaldo';
 EXEC msdb.dbo.sp_add_jobstep
      @job_name      = N'GimnasioDB - Backup FULL',
      @step_name     = N'Backup FULL',
@@ -1063,8 +1085,9 @@ GO
 
 -- DIFERENCIAL: martes a domingo a las 3:00 PM (21:00 UTC)
 EXEC msdb.dbo.sp_add_job
-     @job_name    = N'GimnasioDB - Backup DIFERENCIAL',
-     @description = N'Backup diferencial de martes a domingo, 3:00 PM (21:00 UTC)';
+     @job_name         = N'GimnasioDB - Backup DIFERENCIAL',
+     @description      = N'Backup diferencial de martes a domingo, 3:00 PM (21:00 UTC)',
+     @owner_login_name = N'login_respaldo';
 EXEC msdb.dbo.sp_add_jobstep
      @job_name      = N'GimnasioDB - Backup DIFERENCIAL',
      @step_name     = N'Backup DIFERENCIAL',
@@ -1086,8 +1109,9 @@ GO
 
 -- LOG: cada 15 minutos, todo el día
 EXEC msdb.dbo.sp_add_job
-     @job_name    = N'GimnasioDB - Backup LOG',
-     @description = N'Backup del log de transacciones cada 15 minutos';
+     @job_name         = N'GimnasioDB - Backup LOG',
+     @description      = N'Backup del log de transacciones cada 15 minutos',
+     @owner_login_name = N'login_respaldo';
 EXEC msdb.dbo.sp_add_jobstep
      @job_name      = N'GimnasioDB - Backup LOG',
      @step_name     = N'Backup LOG',
@@ -1120,6 +1144,7 @@ GO
 
 -- 4. Historial de los jobs
 SELECT j.name AS Job,
+       SUSER_SNAME(j.owner_sid) AS Owner,
        msdb.dbo.agent_datetime(h.run_date, h.run_time) AS EjecucionUTC,
        CASE h.run_status WHEN 1 THEN 'Exitoso' WHEN 0 THEN 'Fallido'
                          WHEN 3 THEN 'Cancelado' ELSE 'Otro' END AS Estado,
